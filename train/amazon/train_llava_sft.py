@@ -1,0 +1,337 @@
+import os
+import argparse
+
+parser = argparse.ArgumentParser()
+parser.add_argument('-d', '--dataset', required=True, choices=['Baby_Products', 'Video_Games', 'Musical_Instruments', 'Sports_and_Outdoors'],
+                    help='Amazon dataset category.')
+parser.add_argument('--rag', action='store_true',
+                    help='Use RAG dataset (built by dataset_create_rag.py) with CF path signals.')
+parser.add_argument('--variant', default='', choices=[
+    '',
+    'rag',
+    'rag-no_mm',
+    'rag-no_bfs',
+    'rag-no_path_hist',
+    'rag-no_cf_text',
+    'baseline',
+], help='Named ablation variant suffix to train.')
+parser.add_argument('--k', type=int, default=None,
+                    help='Retrieval-K sensitivity: train on Amazon-{dataset}-training-recurrent-rag-k{K} (K=5 maps to -rag).')
+args = parser.parse_args()
+DATASET = args.dataset
+if args.k is not None:
+    _suffix = "-rag" if args.k == 5 else f"-rag-k{args.k}"
+else:
+    _suffix = f"-{args.variant}" if args.variant else ("-rag" if args.rag else "")
+
+MAX_LENGTH = None
+EPOCH = 4
+LORA_R = 16
+MODEL_ID = "llava-hf/llava-v1.6-mistral-7b-hf"
+REPO_ID = "yeyuyang95/llava-v1.6-mistral-7b-hf-lora"
+WANDB_PROJECT = "LLaVaNeXT"
+WANDB_NAME = f"llava-v1.6-mistral-7b-hf-lora-{DATASET}{_suffix}"
+HF_CACHE_DIR = os.environ.get('HF_HOME', os.path.expanduser('~/.cache/huggingface'))
+BASE_SAVE_DIR = os.environ.get('MODEL_SAVE_DIR', os.path.join(os.path.dirname(HF_CACHE_DIR), 'LLaVA'))
+SAVE_DIR = os.path.join(BASE_SAVE_DIR, f"llava-v1.6-mistral-7b-hf-lora-{DATASET}{_suffix}-e{EPOCH}-r{LORA_R}")
+
+from transformers import AutoProcessor
+from transformers import BitsAndBytesConfig, LlavaNextForConditionalGeneration
+import torch
+from torch.utils.data import Dataset
+from typing import Any, Dict
+import random
+from peft import LoraConfig, prepare_model_for_kbit_training, get_peft_model
+from load_llava_dataset import LlavaDataset, LlavaDataset2
+from PIL import ImageOps
+from lightning.pytorch.loggers import WandbLogger
+import lightning as L
+from torch.utils.data import DataLoader
+import re
+from nltk import edit_distance
+import numpy as np
+from lightning.pytorch.callbacks import Callback, ModelCheckpoint
+from lightning.pytorch.callbacks.early_stopping import EarlyStopping
+import logging
+
+from huggingface_hub import HfApi
+
+torch.set_float32_matmul_precision('medium')  # performance gain
+
+logging.getLogger("transformers").setLevel(logging.ERROR)
+
+processor = AutoProcessor.from_pretrained(MODEL_ID, cache_dir=HF_CACHE_DIR, local_files_only=True)
+processor.tokenizer.padding_side = "right"
+
+USE_LORA = True
+USE_QLORA = False
+
+if USE_QLORA or USE_LORA:
+    if USE_QLORA:
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=torch.float16
+        )
+
+        model = LlavaNextForConditionalGeneration.from_pretrained(
+            MODEL_ID,
+            cache_dir=HF_CACHE_DIR,
+            torch_dtype=torch.float16,
+            quantization_config=bnb_config,
+            local_files_only=True,
+        )
+    else:
+        model = LlavaNextForConditionalGeneration.from_pretrained(
+            MODEL_ID,
+            cache_dir=HF_CACHE_DIR,
+            torch_dtype=torch.float16,
+            # _attn_implementation="flash_attention_2",
+            local_files_only=True,
+        )
+else:
+    model = LlavaNextForConditionalGeneration.from_pretrained(
+        MODEL_ID,
+        cache_dir=HF_CACHE_DIR,
+        torch_dtype=torch.float16,
+        _attn_implementation="flash_attention_2",
+        local_files_only=True,
+    )
+
+
+def find_all_linear_names(model):
+    cls = torch.nn.Linear
+    lora_module_names = set()
+    multimodal_keywords = ['multi_modal_projector', 'vision_model']
+    for name, module in model.named_modules():
+        if any(mm_keyword in name for mm_keyword in multimodal_keywords):
+            continue
+        if isinstance(module, cls):
+            names = name.split('.')
+            lora_module_names.add(names[0] if len(names) == 1 else names[-1])
+
+    if 'lm_head' in lora_module_names:
+        lora_module_names.remove('lm_head')
+    return list(lora_module_names)
+
+print(find_all_linear_names(model))
+
+
+lora_config = LoraConfig(
+    r=LORA_R,
+    lora_alpha=32,
+    lora_dropout=0.1,
+    target_modules=find_all_linear_names(model),
+    init_lora_weights="gaussian",
+)
+
+model = prepare_model_for_kbit_training(model)
+model = get_peft_model(model, lora_config)
+
+dataset_path = f"Amazon-{DATASET}-training-recurrent{_suffix}"
+train_dataset = LlavaDataset2(dataset_path, split="train", sort_json_key=False)
+val_dataset = LlavaDataset2(dataset_path, split="validation", sort_json_key=False)
+
+def resize_image(image_list):
+    max_width = max(img.width for img in image_list)
+    max_height = max(img.height for img in image_list)
+
+    padded_images = []
+    for img in image_list:
+        if img.width == max_width and img.height == max_height:
+            padded_images.append(img)
+            continue
+        else:
+            delta_width = max_width - img.width
+            delta_height = max_height - img.height
+            padding = (
+                delta_width // 2, delta_height // 2,
+                delta_width - (delta_width // 2), delta_height - (delta_height // 2))
+            new_img = ImageOps.expand(img, border=padding, fill='black')
+            padded_images.append(new_img)
+
+    return padded_images
+
+def train_collate_fn(examples):
+    images = []
+    texts = []
+    for example in examples:
+        image, prompt_text, ground_truth = example
+        images.append(image)
+        prompt = f"[INST] <image>\n{prompt_text} [/INST] {ground_truth}"
+        texts.append(prompt)
+    images = resize_image(images)
+
+    batch = processor(text=texts, images=images, padding=True, truncation=True, max_length=MAX_LENGTH, return_tensors="pt")
+
+    labels = batch["input_ids"].clone()
+    labels[labels == processor.tokenizer.pad_token_id] = -100
+    batch["labels"] = labels
+
+    input_ids = batch["input_ids"]
+    attention_mask = batch["attention_mask"]
+    pixel_values = batch["pixel_values"]
+    image_sizes = batch["image_sizes"]
+    labels = batch["labels"]
+
+    return input_ids, attention_mask, pixel_values, image_sizes, labels
+
+def eval_collate_fn(examples):
+    images = []
+    texts = []
+    answers = []
+    for example in examples:
+        image, prompt_text, ground_truth = example
+        images.append(image)
+        prompt = f"[INST] <image>\n{prompt_text} [/INST]"
+        texts.append(prompt)
+        answers.append(ground_truth)
+    images = resize_image(images)
+
+    batch = processor(text=texts, images=images, return_tensors="pt", padding=True)
+
+    input_ids = batch["input_ids"]
+    attention_mask = batch["attention_mask"]
+    pixel_values = batch["pixel_values"]
+    image_sizes = batch["image_sizes"]
+
+    return input_ids, attention_mask, pixel_values, image_sizes, answers
+
+class LlavaModelPLModule(L.LightningModule):
+    def __init__(self, config, processor, model):
+        super().__init__()
+        self.config = config
+        self.processor = processor
+        self.model = model
+
+        self.batch_size = config.get("batch_size")
+
+    def training_step(self, batch, batch_idx):
+        input_ids, attention_mask, pixel_values, image_sizes, labels = batch
+        self.model.train()
+        outputs = self.model(input_ids=input_ids,
+                            attention_mask=attention_mask,
+                            pixel_values=pixel_values,
+                            image_sizes=image_sizes,
+                            labels=labels
+                          )
+        loss = outputs.loss
+        batch_size = input_ids.size(0)
+        self.log("train_loss", loss, batch_size=batch_size)
+        return loss
+
+    def validation_step(self, batch, batch_idx, dataset_idx=0):
+        input_ids, attention_mask, pixel_values, image_sizes, answers = batch
+        self.model.eval()
+        generated_ids = self.model.generate(input_ids=input_ids, attention_mask=attention_mask,
+                                       pixel_values=pixel_values, image_sizes=image_sizes, max_new_tokens=5)
+        predictions = self.processor.batch_decode(generated_ids[:, input_ids.size(1):], skip_special_tokens=True)
+
+        scores = []
+        for pred, answer in zip(predictions, answers):
+            pred = re.sub(r"(?:(?<=>) | (?=</s_))", "", pred)
+            scores.append(edit_distance(pred, answer) / max(len(pred), len(answer)))
+
+            if self.config.get("verbose", False) and len(scores) == 1:
+                print(f"Prediction: {pred}")
+                print(f"    Answer: {answer}")
+                print(f" Normed ED: {scores[0]}")
+
+        self.log("val_edit_distance", np.mean(scores), sync_dist=True)
+        return scores
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.AdamW(self.parameters(), lr=self.config.get("lr"))
+        return optimizer
+
+    def train_dataloader(self):
+        return DataLoader(train_dataset, collate_fn=train_collate_fn, batch_size=self.batch_size, shuffle=True, num_workers=0)
+
+    def val_dataloader(self):
+        return DataLoader(val_dataset, collate_fn=eval_collate_fn, batch_size=self.batch_size, shuffle=False, num_workers=0)
+
+config = {"max_epochs": EPOCH,
+          "check_val_every_n_epoch": 1,
+          "gradient_clip_val": 1.0,
+          "accumulate_grad_batches": 4,
+          "lr": 2e-5,
+          "batch_size": 1,
+          "num_nodes": 1,
+          "warmup_steps": 50,
+          "result_path": BASE_SAVE_DIR,
+          "verbose": True,
+}
+
+model_module = LlavaModelPLModule(config, processor, model)
+
+api = HfApi()
+
+class PushToHubCallback(Callback):
+    def on_train_epoch_end(self, trainer, pl_module):
+        print(f"Pushing model to the hub, epoch {trainer.current_epoch}")
+        pl_module.model.push_to_hub(REPO_ID,
+                                    commit_message=f"Training in progress, epoch {trainer.current_epoch}")
+
+    def on_train_end(self, trainer, pl_module):
+        print(f"Pushing model to the hub after training")
+        pl_module.processor.push_to_hub(REPO_ID,
+                                    commit_message=f"Training done")
+        pl_module.model.push_to_hub(REPO_ID,
+                                    commit_message=f"Training done")
+
+class SaveToDiskCallback(Callback):
+    def on_train_epoch_end(self, trainer, pl_module):
+        if trainer.global_rank == 0:
+            print(f"Saving model to disk, epoch {trainer.current_epoch}")
+            for name, param in pl_module.model.named_parameters():
+                if "lora" in name and "layers.31" in name:
+                    print(f"LoRA Layer {name}: {param.size()}")
+            pl_module.model.save_pretrained(SAVE_DIR)
+            pl_module.processor.save_pretrained(SAVE_DIR)
+
+    def on_train_end(self, trainer, pl_module):
+        if trainer.global_rank == 0:
+            print(f"Saving model to disk after training")
+            for name, param in pl_module.model.named_parameters():
+                if "lora" in name and "layers.31" in name:
+                    print(f"LoRA Layer {name}: {param.size()}")
+            pl_module.model.save_pretrained(SAVE_DIR)
+            pl_module.processor.save_pretrained(SAVE_DIR)
+
+
+early_stop_callback = EarlyStopping(monitor="val_edit_distance", patience=3, verbose=False, mode="min")
+
+# checkpoint_callback = ModelCheckpoint(
+#     dirpath=BASE_SAVE_DIR,
+#     filename=f'llava-v1.6-mistral-7b-lora-{DATASET}{_suffix}',
+#     save_top_k=0,
+#     save_last=True,
+#     verbose=True,
+# )
+
+import torch
+if torch.cuda.is_available():
+    _accelerator, _devices, _strategy = "gpu", "auto", "deepspeed_stage_2"
+elif torch.backends.mps.is_available():
+    _accelerator, _devices, _strategy = "mps", 1, "auto"
+else:
+    _accelerator, _devices, _strategy = "cpu", 1, "auto"
+print(f"Accelerator: {_accelerator}, Devices: {_devices}")
+
+trainer = L.Trainer(
+        accelerator=_accelerator,
+        devices=_devices,
+        strategy=_strategy,
+        max_epochs=config.get("max_epochs"),
+        accumulate_grad_batches=config.get("accumulate_grad_batches"),
+        check_val_every_n_epoch=config.get("check_val_every_n_epoch"),
+        gradient_clip_val=config.get("gradient_clip_val"),
+        precision="16-mixed",
+        log_every_n_steps=10,
+        limit_val_batches=5,
+        num_sanity_val_steps=0,
+        enable_checkpointing=False,
+        default_root_dir=os.path.join(os.path.dirname(__file__), f"lightning_logs_{DATASET}{_suffix}"),
+        callbacks=[SaveToDiskCallback()]
+)
+
+# _last_ckpt = os.path.join(BASE_SAVE_DIR, f"llava-v1.6-mistral-7b-lora-{DATASET}{_suffix}-last.ckpt")
+trainer.fit(model_module)

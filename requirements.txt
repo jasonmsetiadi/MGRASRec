@@ -1,0 +1,15 @@
+torch
+multiprocess
+transformers
+datasets
+torchvision
+scikit-learn
+peft
+lightning
+nltk
+dgl==2.1.0
+torchdata==0.7.0
+numpy==1.26.4
+pydantic
+matplotlib
+faiss-cpu
